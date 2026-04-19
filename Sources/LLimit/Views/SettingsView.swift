@@ -188,6 +188,7 @@ private struct AccountsTab: View {
                 initial: target.account,
                 isAdding: target.isAdding,
                 usageState: refresher.states[target.id] ?? .idle,
+                existingConfigDirs: Set(store.accounts.map(\.configDir)),
                 onSave: { updated in save(updated, wasAdding: target.isAdding) },
                 onCancel: { editing = nil },
                 onLogin: { acc in loginAccount = acc }
@@ -215,18 +216,8 @@ private struct AccountsTab: View {
         editing = EditTarget(id: acc.id, account: acc, isAdding: true)
     }
 
-    /// Two Claude accounts pointing at the same configDir share both the
-    /// CLI's keychain entry and our credential snapshot, which is exactly
-    /// what the user just hit. Auto-bump the path so a fresh Add always
-    /// produces a usable second account.
     private func uniqueDir(from base: String) -> String {
-        let inUse = Set(store.accounts.map(\.configDir))
-        if !inUse.contains(base) { return base }
-        for n in 2...20 {
-            let candidate = "\(base)-\(n)"
-            if !inUse.contains(candidate) { return candidate }
-        }
-        return base
+        EditForm.uniqueDir(from: base, excluding: Set(store.accounts.map(\.configDir)))
     }
 
     private func save(_ incoming: Account, wasAdding: Bool) {
@@ -259,6 +250,7 @@ private struct EditForm: View {
     @State private var draft: Account
     let isAdding: Bool
     let usageState: UsageState
+    let existingConfigDirs: Set<String>
     let onSave: (Account) -> Void
     let onCancel: () -> Void
     let onLogin: (Account) -> Void
@@ -266,12 +258,14 @@ private struct EditForm: View {
     init(initial: Account,
          isAdding: Bool,
          usageState: UsageState = .idle,
+         existingConfigDirs: Set<String> = [],
          onSave: @escaping (Account) -> Void,
          onCancel: @escaping () -> Void,
          onLogin: @escaping (Account) -> Void) {
         _draft = State(initialValue: initial)
         self.isAdding = isAdding
         self.usageState = usageState
+        self.existingConfigDirs = existingConfigDirs
         self.onSave = onSave
         self.onCancel = onCancel
         self.onLogin = onLogin
@@ -293,9 +287,8 @@ private struct EditForm: View {
                 .pickerStyle(.segmented)
                 .onChange(of: draft.provider) { _, p in
                     let home = FileManager.default.homeDirectoryForCurrentUser.path
-                    if draft.configDir.hasSuffix("/.claude") || draft.configDir.hasSuffix("/.codex") {
-                        draft.configDir = home + (p == .claude ? "/.claude" : "/.codex")
-                    }
+                    let base = home + (p == .claude ? "/.claude" : "/.codex")
+                    draft.configDir = Self.uniqueDir(from: base, excluding: existingConfigDirs)
                 }
                 HStack {
                     TextField("Config dir", text: $draft.configDir,
@@ -330,6 +323,15 @@ private struct EditForm: View {
                     .disabled(!isValidConfigDir(draft.configDir))
             }
         }
+    }
+
+    static func uniqueDir(from base: String, excluding inUse: Set<String>) -> String {
+        if !inUse.contains(base) { return base }
+        for n in 2...20 {
+            let candidate = "\(base)-\(n)"
+            if !inUse.contains(candidate) { return candidate }
+        }
+        return base
     }
 
     private func isValidConfigDir(_ path: String) -> Bool {
