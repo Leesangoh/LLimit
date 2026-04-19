@@ -278,6 +278,7 @@ private struct EditForm: View {
                         Text(p.displayName).tag(p)
                     }
                 }
+                .pickerStyle(.segmented)
                 .onChange(of: draft.provider) { _, p in
                     let home = FileManager.default.homeDirectoryForCurrentUser.path
                     if draft.configDir.hasSuffix("/.claude") || draft.configDir.hasSuffix("/.codex") {

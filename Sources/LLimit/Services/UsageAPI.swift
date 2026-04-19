@@ -237,9 +237,27 @@ private actor RateLimitsCache {
         }
         inflight[token] = task
         defer { inflight[token] = nil }
-        let value = try await task.value
-        cache[token] = Entry(value: value, at: Date())
-        return value
+        do {
+            let value = try await task.value
+            cache[token] = Entry(value: value, at: Date())
+            return value
+        } catch {
+            // Fall back to the last known-good payload if we have one.
+            // Anthropic 429s `/api/oauth/usage` aggressively (especially
+            // for accounts at high utilization, which is precisely when the
+            // user most wants to see the numbers); without this fallback the
+            // popover blanks to "no usage windows" on every transient 429.
+            // The numbers are slightly stale but still better than nothing,
+            // and the next successful fetch re-freshens within `ttl`.
+            if let entry = cache[token] {
+                let age = Int(Date().timeIntervalSince(entry.at))
+                FileHandle.standardError.write(Data(
+                    "[claude] usage fetch failed (\(error)); using cached \(age)s-old data\n".utf8
+                ))
+                return entry.value
+            }
+            throw error
+        }
     }
 }
 

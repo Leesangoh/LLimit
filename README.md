@@ -12,19 +12,27 @@ accounts, without leaving the keyboard.
 
 ## Install
 
-### From GitHub Releases (recommended)
+### One-line install (recommended)
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/rntlqvnf/LLimit/main/install.sh | bash
+```
+
+Downloads the latest release, installs to `/Applications/LLimit.app`,
+strips the macOS quarantine flag (so Gatekeeper doesn't block first launch),
+and opens the app. Apple Silicon only for now.
+
+### Manual install
 
 1. Grab the latest `LLimit-<version>.zip` from the
    [Releases page](https://github.com/rntlqvnf/LLimit/releases).
 2. Unzip and drag `LLimit.app` into `/Applications`.
-3. **First launch only** — the build is ad-hoc signed (no $99 Apple Developer
-   account), so Gatekeeper will refuse the first double-click. Pick one:
-   - **Right-click → Open → Open** in the dialog. Done forever.
-   - Or, if macOS shows *"could not be opened because Apple cannot check it
-     for malicious software"*, open **System Settings → Privacy & Security**,
-     scroll to the message about LLimit, click **Open Anyway**.
-   - Or, from a terminal:
-     `xattr -dr com.apple.quarantine /Applications/LLimit.app`
+3. The build is ad-hoc signed (no $99 Apple Developer account), so the first
+   double-click will be blocked by Gatekeeper. Pick one:
+   - **Right-click → Open → Open** in the dialog (older macOS).
+   - **System Settings → Privacy & Security** → scroll to the LLimit
+     message → **Open Anyway** (macOS 15+).
+   - Terminal: `xattr -dr com.apple.quarantine /Applications/LLimit.app`
 
 ### Build from source
 
