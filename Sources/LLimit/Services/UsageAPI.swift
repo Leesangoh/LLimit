@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 protocol UsageAPI {
     func fetch(account: Account) async throws -> UsageSnapshot
@@ -104,7 +105,7 @@ struct AnthropicUsageAPI: UsageAPI {
         )
     }
 
-    fileprivate struct RateLimit: Decodable {
+    fileprivate struct RateLimit: Codable {
         let utilization: Double
         let resetsAt: String?
         var usedPercentage: Double { utilization }
@@ -122,7 +123,7 @@ struct AnthropicUsageAPI: UsageAPI {
         }
     }
 
-    fileprivate struct RateLimits: Decodable {
+    fileprivate struct RateLimits: Codable {
         let fiveHour: RateLimit?
         let sevenDay: RateLimit?
         let sevenDayOpus: RateLimit?
@@ -191,6 +192,12 @@ struct AnthropicUsageAPI: UsageAPI {
     }
 
     fileprivate static func doFetchRateLimits(token: String) async throws -> RateLimits {
+        try await AnthropicRequestGate.shared.run {
+            try await Self.sendRateLimitsRequest(token: token)
+        }
+    }
+
+    private static func sendRateLimitsRequest(token: String) async throws -> RateLimits {
         var req = URLRequest(url: URL(string: "https://api.anthropic.com/api/oauth/usage")!)
         req.httpMethod = "GET"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -210,46 +217,125 @@ struct AnthropicUsageAPI: UsageAPI {
 
 }
 
+/// Anthropic 429s `/api/oauth/usage` when two requests land back-to-back from
+/// the same IP — even with different bearer tokens. The refresh coordinator
+/// fans out across accounts in parallel, which means a 2-account user almost
+/// always loses one window to a rate-limit. Serializing requests through this
+/// gate (with a small spacing so the bucket can refill) lets all accounts
+/// fetch successfully; the disk cache below covers any that still 429.
+private actor AnthropicRequestGate {
+    static let shared = AnthropicRequestGate()
+    private var lastRequestAt: Date?
+    private let minSpacing: TimeInterval = 1.5
+
+    func run<T: Sendable>(_ work: @Sendable () async throws -> T) async throws -> T {
+        if let last = lastRequestAt {
+            let elapsed = Date().timeIntervalSince(last)
+            if elapsed < minSpacing {
+                let wait = minSpacing - elapsed
+                try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+            }
+        }
+        lastRequestAt = Date()
+        return try await work()
+    }
+}
+
 private actor RateLimitsCache {
     static let shared = RateLimitsCache()
 
-    private struct Entry {
+    private struct Entry: Codable {
         let value: AnthropicUsageAPI.RateLimits
         let at: Date
     }
 
+    /// Keyed by `tokenHash(token)` so we never write raw bearers to filenames.
     private var cache: [String: Entry] = [:]
     private var inflight: [String: Task<AnthropicUsageAPI.RateLimits, Error>] = [:]
     private let ttl: TimeInterval = 45
+
+    private static var cacheDir: URL {
+        let fm = FileManager.default
+        let base = (try? fm.url(for: .applicationSupportDirectory,
+                                in: .userDomainMask,
+                                appropriateFor: nil, create: true))
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        let dir = base.appendingPathComponent("LLimit/usage_cache", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
+        return dir
+    }
+
+    private static func tokenHash(_ token: String) -> String {
+        let h = SHA256.hash(data: Data(token.utf8))
+        return h.prefix(8).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func diskURL(forKey key: String) -> URL {
+        cacheDir.appendingPathComponent("\(key).json")
+    }
+
+    private func loadFromDisk(key: String) -> Entry? {
+        let url = Self.diskURL(forKey: key)
+        guard let data = try? Data(contentsOf: url),
+              let entry = try? JSONDecoder().decode(Entry.self, from: data) else {
+            return nil
+        }
+        return entry
+    }
+
+    private func writeToDisk(key: String, entry: Entry) {
+        let url = Self.diskURL(forKey: key)
+        guard let data = try? JSONEncoder().encode(entry) else { return }
+        try? data.write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes(
+            [.posixPermissions: 0o600], ofItemAtPath: url.path
+        )
+    }
 
     func fetch(
         token: String,
         perform: @Sendable @escaping (String) async throws -> AnthropicUsageAPI.RateLimits
     ) async throws -> AnthropicUsageAPI.RateLimits {
-        if let entry = cache[token], Date().timeIntervalSince(entry.at) < ttl {
+        let key = Self.tokenHash(token)
+
+        // Hot path: in-memory hit, fresh.
+        if let entry = cache[key], Date().timeIntervalSince(entry.at) < ttl {
             return entry.value
         }
-        if let existing = inflight[token] {
+
+        // First touch this process — bring whatever's on disk into memory so
+        // a cold start at the moment Anthropic is 429ing still has SOMETHING
+        // to show. The disk entry may be stale; we still try a network fetch
+        // and only fall back to the disk entry if the fetch fails.
+        if cache[key] == nil, let disk = loadFromDisk(key: key) {
+            cache[key] = disk
+            if Date().timeIntervalSince(disk.at) < ttl {
+                return disk.value
+            }
+        }
+
+        if let existing = inflight[key] {
             return try await existing.value
         }
         let task = Task<AnthropicUsageAPI.RateLimits, Error> {
             try await perform(token)
         }
-        inflight[token] = task
-        defer { inflight[token] = nil }
+        inflight[key] = task
+        defer { inflight[key] = nil }
         do {
             let value = try await task.value
-            cache[token] = Entry(value: value, at: Date())
+            let entry = Entry(value: value, at: Date())
+            cache[key] = entry
+            writeToDisk(key: key, entry: entry)
             return value
         } catch {
-            // Fall back to the last known-good payload if we have one.
-            // Anthropic 429s `/api/oauth/usage` aggressively (especially
-            // for accounts at high utilization, which is precisely when the
-            // user most wants to see the numbers); without this fallback the
-            // popover blanks to "no usage windows" on every transient 429.
-            // The numbers are slightly stale but still better than nothing,
-            // and the next successful fetch re-freshens within `ttl`.
-            if let entry = cache[token] {
+            // Anthropic 429s `/api/oauth/usage` hard, especially for
+            // accounts at high utilization — exactly when the user most
+            // wants to see the numbers. Fall back to the last persisted
+            // RateLimits so the popover keeps showing real (if slightly
+            // stale) data instead of "no usage windows".
+            if let entry = cache[key] {
                 let age = Int(Date().timeIntervalSince(entry.at))
                 FileHandle.standardError.write(Data(
                     "[claude] usage fetch failed (\(error)); using cached \(age)s-old data\n".utf8
