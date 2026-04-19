@@ -38,6 +38,10 @@ final class RefreshCoordinator: ObservableObject {
         lastRefreshedAt = Date()
     }
 
+    func forget(_ id: UUID) {
+        states.removeValue(forKey: id)
+    }
+
     func refresh(_ account: Account) async {
         states[account.id] = .loading
         do {

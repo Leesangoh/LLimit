@@ -2,7 +2,7 @@ import SwiftUI
 import AppKit
 
 @main
-struct LLMBarApp: App {
+struct LLimitApp: App {
     @StateObject private var accountStore: AccountStore
     @StateObject private var refresher: RefreshCoordinator
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Tag and publish a GitHub Release with the universal LLMBar.app zipped.
+# Tag and publish a GitHub Release with the universal LLimit.app zipped.
 #
 # Requires `gh` authenticated against the repo and a clean working tree.
 #
@@ -28,7 +28,7 @@ fi
 echo "==> packaging"
 Scripts/package_app.sh "$VERSION" zip
 
-ZIP="build/release/LLMBar-${VERSION}.zip"
+ZIP="build/release/LLimit-${VERSION}.zip"
 if [ ! -f "$ZIP" ]; then
   echo "missing $ZIP after packaging" >&2
   exit 1
@@ -40,7 +40,7 @@ git push origin "$TAG"
 
 echo "==> creating GitHub release"
 gh release create "$TAG" "$ZIP" \
-    --title "LLMBar $TAG" \
+    --title "LLimit $TAG" \
     --notes "$NOTES"
 
 echo

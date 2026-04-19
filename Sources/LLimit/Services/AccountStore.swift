@@ -14,7 +14,19 @@ final class AccountStore: ObservableObject {
                                       appropriateFor: nil,
                                       create: true))
             ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        let supportDir = appSupport.appendingPathComponent("LLMBar", isDirectory: true)
+        let supportDir = appSupport.appendingPathComponent("LLimit", isDirectory: true)
+
+        // Rename: ~/Library/Application Support/LLMBar → LLimit (one-shot).
+        // Carries over both `accounts.json` AND the `credentials/` subdir
+        // (per-account OAuth/session snapshots), so users keep their saved
+        // sign-ins after the rename. Only runs if the new dir doesn't already
+        // exist — never clobbers post-rename state.
+        let oldSupportDir = appSupport.appendingPathComponent("LLMBar", isDirectory: true)
+        if !fm.fileExists(atPath: supportDir.path),
+           fm.fileExists(atPath: oldSupportDir.path) {
+            try? fm.moveItem(at: oldSupportDir, to: supportDir)
+        }
+
         try? fm.createDirectory(at: supportDir, withIntermediateDirectories: true)
         storeURL = supportDir.appendingPathComponent("accounts.json")
 
@@ -37,6 +49,9 @@ final class AccountStore: ObservableObject {
 
     func remove(_ account: Account) {
         accounts.removeAll { $0.id == account.id }
+        if account.provider == .claude {
+            ClaudeAuthSource.deleteSnapshot(for: account.id)
+        }
         save()
     }
 
@@ -45,6 +60,20 @@ final class AccountStore: ObservableObject {
             accounts[i] = account
             save()
         }
+    }
+
+    func move(fromOffsets: IndexSet, toOffset: Int) {
+        accounts.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        save()
+    }
+
+    func move(_ accountId: UUID, by delta: Int) {
+        guard let i = accounts.firstIndex(where: { $0.id == accountId }) else { return }
+        let target = max(0, min(accounts.count - 1, i + delta))
+        guard target != i else { return }
+        let item = accounts.remove(at: i)
+        accounts.insert(item, at: target)
+        save()
     }
 
     func setPollInterval(_ seconds: Int) {

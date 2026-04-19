@@ -2,15 +2,15 @@
 import PackageDescription
 
 let package = Package(
-    name: "LLMBar",
+    name: "LLimit",
     platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "LLMBar", targets: ["LLMBar"])
+        .executable(name: "LLimit", targets: ["LLimit"])
     ],
     targets: [
         .executableTarget(
-            name: "LLMBar",
-            path: "Sources/LLMBar"
+            name: "LLimit",
+            path: "Sources/LLimit"
         )
     ]
 )

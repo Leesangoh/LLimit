@@ -1,6 +1,60 @@
 import SwiftUI
 import AppKit
 
+/// Reads per-configDir login state straight off disk so the Accounts UI
+/// can show an at-a-glance signed-in/-out indicator without waiting for
+/// a refresh round-trip.
+enum LoginStatus: Equatable {
+    case signedIn(email: String?)
+    case signedOut
+
+    var isSignedIn: Bool {
+        if case .signedIn = self { return true }
+        return false
+    }
+
+    static func read(_ account: Account) -> LoginStatus {
+        switch account.provider {
+        case .claude:
+            let path = account.configDir + "/.claude.json"
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let oauth = root["oauthAccount"] as? [String: Any] else {
+                return .signedOut
+            }
+            let email = oauth["emailAddress"] as? String
+            return .signedIn(email: email)
+        case .codex:
+            let path = account.configDir + "/auth.json"
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                  let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                return .signedOut
+            }
+            let tokens = root["tokens"] as? [String: Any]
+            let hasToken = (tokens?["access_token"] as? String)?.isEmpty == false
+                || (root["OPENAI_API_KEY"] as? String)?.isEmpty == false
+            guard hasToken else { return .signedOut }
+            // Email lives inside the id_token JWT; we parse it lazily here
+            // since this read happens off the menu-bar hot path.
+            var email: String?
+            if let idToken = tokens?["id_token"] as? String {
+                let parts = idToken.split(separator: ".")
+                if parts.count >= 2 {
+                    var s = String(parts[1])
+                        .replacingOccurrences(of: "-", with: "+")
+                        .replacingOccurrences(of: "_", with: "/")
+                    while s.count % 4 != 0 { s.append("=") }
+                    if let d = Data(base64Encoded: s),
+                       let claims = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                        email = claims["email"] as? String
+                    }
+                }
+            }
+            return .signedIn(email: email)
+        }
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject var store: AccountStore
     @EnvironmentObject var refresher: RefreshCoordinator
@@ -16,7 +70,7 @@ struct SettingsView: View {
         }
         .frame(width: 620, height: 520)
         .sheet(item: $loginAccount) { account in
-            LoginSheet(account: account) {
+            LoginSheet(account: account, store: store) {
                 Task { await refresher.refresh(account) }
             }
         }
@@ -31,8 +85,13 @@ private struct AccountsTab: View {
     @Binding var loginAccount: Account?
 
     @State private var selection: UUID?
-    @State private var draft: Account?
-    @State private var isAdding = false
+    @State private var editing: EditTarget?
+
+    private struct EditTarget: Identifiable, Equatable {
+        let id: UUID
+        var account: Account
+        var isAdding: Bool
+    }
 
     var body: some View {
         HSplitView {
@@ -41,7 +100,7 @@ private struct AccountsTab: View {
             detail
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .onChange(of: selection) { _, new in loadDraft(for: new) }
+        .onChange(of: selection) { _, new in loadEditing(for: new) }
     }
 
     private var list: some View {
@@ -49,17 +108,21 @@ private struct AccountsTab: View {
             List(selection: $selection) {
                 ForEach(store.accounts) { acc in
                     HStack(spacing: 8) {
-                        Image(systemName: acc.provider == .claude
-                              ? "sparkle"
-                              : "chevron.left.forwardslash.chevron.right")
-                            .foregroundStyle(acc.provider == .claude ? .orange : .cyan)
+                        ProviderIcon(provider: acc.provider, size: 16)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(acc.name).font(.body)
                             Text(acc.provider.displayName)
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
+                        Spacer()
+                        Circle()
+                            .fill(LoginStatus.read(acc).isSignedIn ? Color.green : Color.secondary.opacity(0.4))
+                            .frame(width: 7, height: 7)
                     }
                     .tag(acc.id)
+                }
+                .onMove { from, to in
+                    store.move(fromOffsets: from, toOffset: to)
                 }
             }
             Divider()
@@ -70,17 +133,30 @@ private struct AccountsTab: View {
                     Label("Add", systemImage: "plus")
                 }
                 Button {
-                    if let id = selection,
-                       let acc = store.accounts.first(where: { $0.id == id }) {
-                        store.remove(acc)
-                        selection = nil
-                        draft = nil
-                    }
+                    guard let id = selection,
+                          let acc = store.accounts.first(where: { $0.id == id })
+                    else { return }
+                    selection = nil
+                    editing = nil
+                    refresher.forget(id)
+                    store.remove(acc)
                 } label: {
                     Label("Remove", systemImage: "minus")
                 }
                 .disabled(selection == nil)
                 Spacer()
+                Button {
+                    if let id = selection { store.move(id, by: -1) }
+                } label: {
+                    Image(systemName: "arrow.up")
+                }
+                .disabled(!canMove(by: -1))
+                Button {
+                    if let id = selection { store.move(id, by: 1) }
+                } label: {
+                    Image(systemName: "arrow.down")
+                }
+                .disabled(!canMove(by: 1))
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
@@ -88,16 +164,26 @@ private struct AccountsTab: View {
         }
     }
 
+    private func canMove(by delta: Int) -> Bool {
+        guard let id = selection,
+              let i = store.accounts.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        let target = i + delta
+        return target >= 0 && target < store.accounts.count
+    }
+
     @ViewBuilder
     private var detail: some View {
-        if let draft = Binding($draft) {
+        if let target = editing {
             EditForm(
-                draft: draft,
-                isAdding: isAdding,
-                onSave: { save() },
-                onCancel: { self.draft = nil; self.isAdding = false },
+                initial: target.account,
+                isAdding: target.isAdding,
+                onSave: { updated in save(updated, wasAdding: target.isAdding) },
+                onCancel: { editing = nil },
                 onLogin: { acc in loginAccount = acc }
             )
+            .id(target.id)
             .padding()
         } else {
             VStack(spacing: 8) {
@@ -112,45 +198,72 @@ private struct AccountsTab: View {
     }
 
     private func startAdd() {
-        isAdding = true
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        draft = Account(name: "", provider: .claude, configDir: home + "/.claude")
+        let base = home + "/.claude"
+        let acc = Account(name: "", provider: .claude,
+                          configDir: uniqueDir(from: base))
         selection = nil
+        editing = EditTarget(id: acc.id, account: acc, isAdding: true)
     }
 
-    private func save() {
-        guard var d = draft else { return }
+    /// Two Claude accounts pointing at the same configDir share both the
+    /// CLI's keychain entry and our credential snapshot, which is exactly
+    /// what the user just hit. Auto-bump the path so a fresh Add always
+    /// produces a usable second account.
+    private func uniqueDir(from base: String) -> String {
+        let inUse = Set(store.accounts.map(\.configDir))
+        if !inUse.contains(base) { return base }
+        for n in 2...20 {
+            let candidate = "\(base)-\(n)"
+            if !inUse.contains(candidate) { return candidate }
+        }
+        return base
+    }
+
+    private func save(_ incoming: Account, wasAdding: Bool) {
+        var d = incoming
         if d.name.trimmingCharacters(in: .whitespaces).isEmpty {
             d.name = "\(d.provider.displayName) (\(URL(fileURLWithPath: d.configDir).lastPathComponent))"
         }
-        if isAdding {
+        editing = nil
+        selection = nil
+        if wasAdding {
             store.add(d)
-            selection = d.id
-            isAdding = false
         } else {
             store.update(d)
         }
-        draft = nil
+        selection = d.id
         Task { await refresher.refresh(d) }
     }
 
-    private func loadDraft(for id: UUID?) {
+    private func loadEditing(for id: UUID?) {
         guard let id, let acc = store.accounts.first(where: { $0.id == id }) else {
-            if !isAdding { draft = nil }
+            if editing?.isAdding != true { editing = nil }
             return
         }
-        isAdding = false
-        draft = acc
+        editing = EditTarget(id: acc.id, account: acc, isAdding: false)
     }
 
 }
 
 private struct EditForm: View {
-    @Binding var draft: Account
+    @State private var draft: Account
     let isAdding: Bool
-    let onSave: () -> Void
+    let onSave: (Account) -> Void
     let onCancel: () -> Void
     let onLogin: (Account) -> Void
+
+    init(initial: Account,
+         isAdding: Bool,
+         onSave: @escaping (Account) -> Void,
+         onCancel: @escaping () -> Void,
+         onLogin: @escaping (Account) -> Void) {
+        _draft = State(initialValue: initial)
+        self.isAdding = isAdding
+        self.onSave = onSave
+        self.onCancel = onCancel
+        self.onLogin = onLogin
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -185,6 +298,10 @@ private struct EditForm: View {
                 }
             }
 
+            if !isAdding {
+                loginStatusRow
+            }
+
             Spacer()
 
             HStack {
@@ -194,10 +311,35 @@ private struct EditForm: View {
                 }
                 Spacer()
                 Button("Cancel", action: onCancel)
-                Button(isAdding ? "Add" : "Save", action: onSave)
+                Button(isAdding ? "Add" : "Save") { onSave(draft) }
                     .keyboardShortcut(.defaultAction)
                     .buttonStyle(.borderedProminent)
                     .disabled(draft.configDir.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var loginStatusRow: some View {
+        let status = LoginStatus.read(draft)
+        HStack(spacing: 6) {
+            switch status {
+            case .signedIn(let email):
+                Image(systemName: "checkmark.seal.fill")
+                    .foregroundStyle(.green)
+                if let email {
+                    Text("Signed in as \(email)")
+                        .font(.callout)
+                } else {
+                    Text("Signed in")
+                        .font(.callout)
+                }
+            case .signedOut:
+                Image(systemName: "xmark.seal")
+                    .foregroundStyle(.secondary)
+                Text("Not signed in")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -285,7 +427,7 @@ private struct GeneralTab: View {
         let fm = FileManager.default
         let url = (try? fm.url(for: .applicationSupportDirectory,
                                in: .userDomainMask, appropriateFor: nil, create: false))?
-            .appendingPathComponent("LLMBar/accounts.json")
-        return url?.path ?? "~/Library/Application Support/LLMBar/accounts.json"
+            .appendingPathComponent("LLimit/accounts.json")
+        return url?.path ?? "~/Library/Application Support/LLimit/accounts.json"
     }
 }

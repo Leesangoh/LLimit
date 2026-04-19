@@ -1,4 +1,4 @@
-# LLMBar
+# LLimit
 
 A native macOS menu-bar app that shows **how much of your Claude Code and
 Codex usage windows you've burned through** — at a glance, across multiple
@@ -14,9 +14,9 @@ accounts, without leaving the keyboard.
 
 ### From GitHub Releases (recommended)
 
-1. Grab the latest `LLMBar-<version>.zip` from the
-   [Releases page](https://github.com/rntlqvnf/LLMBar/releases).
-2. Unzip and drag `LLMBar.app` into `/Applications`.
+1. Grab the latest `LLimit-<version>.zip` from the
+   [Releases page](https://github.com/rntlqvnf/LLimit/releases).
+2. Unzip and drag `LLimit.app` into `/Applications`.
 3. The first launch is ad-hoc signed; if Gatekeeper complains, right-click →
    **Open** → **Open** to bypass once.
 
@@ -25,16 +25,16 @@ accounts, without leaving the keyboard.
 Requires macOS 14+ and Xcode 15 / Swift 5.9.
 
 ```sh
-git clone https://github.com/rntlqvnf/LLMBar.git
-cd LLMBar
-Scripts/package_app.sh                  # → build/release/LLMBar.app
-open build/release/LLMBar.app
+git clone https://github.com/rntlqvnf/LLimit.git
+cd LLimit
+Scripts/package_app.sh                  # → build/release/LLimit.app
+open build/release/LLimit.app
 ```
 
 For a versioned, zipped artifact:
 
 ```sh
-Scripts/package_app.sh 0.2.0 zip        # → build/release/LLMBar-0.2.0.zip
+Scripts/package_app.sh 0.2.0 zip        # → build/release/LLimit-0.2.0.zip
 ```
 
 ---
@@ -71,7 +71,7 @@ Scripts/package_app.sh 0.2.0 zip        # → build/release/LLMBar-0.2.0.zip
 | Codex    | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (`token_count` events)   |
 | Auth     | `Claude Code-credentials` keychain (snapshotted) and `~/.codex/auth.json` |
 
-LLMBar never sends data anywhere except to the same Anthropic OAuth
+LLimit never sends data anywhere except to the same Anthropic OAuth
 endpoint the Claude CLI itself uses.
 
 ---

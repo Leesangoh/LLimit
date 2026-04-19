@@ -50,7 +50,7 @@ struct MenuBarLabel: View {
             }
         }
 
-        let pct = headline.map { Int(($0 * 100).rounded()) }
+        let pct = headline.map { Int(((1 - $0) * 100).rounded()) }
         let color: Color = {
             guard let h = headline else { return .secondary }
             if h >= 0.9 { return .red }
