@@ -18,6 +18,7 @@ struct LoginSheet: View {
         case idle
         case waiting        // browser opened, waiting on callback
         case exchanging     // got code, posting to token endpoint
+        case validating     // token saved, verifying via profile API
         case done
         case failed(String)
     }
@@ -72,12 +73,17 @@ struct LoginSheet: View {
                     Label(buttonTitle, systemImage: "safari")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(oauthStatus == .waiting || oauthStatus == .exchanging)
+                .disabled(isInFlight)
 
-                if oauthStatus == .waiting || oauthStatus == .exchanging {
+                if isInFlight {
                     ProgressView().controlSize(.small)
-                    Button("Cancel sign-in") { cancelOAuth() }
-                        .controlSize(.small)
+                    // Validation is a synchronous API call; don't show Cancel
+                    // for it — canceling mid-validation would leave the token
+                    // saved but unverified, muddling the state.
+                    if oauthStatus != .validating {
+                        Button("Cancel sign-in") { cancelOAuth() }
+                            .controlSize(.small)
+                    }
                 }
             }
 
@@ -97,11 +103,19 @@ struct LoginSheet: View {
         .padding(12)
     }
 
+    private var isInFlight: Bool {
+        switch oauthStatus {
+        case .waiting, .exchanging, .validating: return true
+        default: return false
+        }
+    }
+
     private var buttonTitle: String {
         switch oauthStatus {
         case .idle, .failed: return "Sign in to Claude"
         case .waiting: return "Waiting in browser…"
         case .exchanging: return "Finishing sign-in…"
+        case .validating: return "Verifying token…"
         case .done: return "Done"
         }
     }
@@ -117,6 +131,9 @@ struct LoginSheet: View {
                 .fixedSize(horizontal: false, vertical: true)
         case .exchanging:
             Text("Exchanging authorization code…")
+                .font(.caption).foregroundStyle(.secondary)
+        case .validating:
+            Text("Verifying token with Anthropic…")
                 .font(.caption).foregroundStyle(.secondary)
         case .done:
             Label("Saved.", systemImage: "checkmark.seal.fill")
@@ -134,7 +151,7 @@ struct LoginSheet: View {
         // `oauthStatus = .waiting` assignment is observed. Spawning two flows
         // means two listeners on two ports and (worse) two browser windows
         // racing the same authorization code.
-        guard oauthStatus != .waiting && oauthStatus != .exchanging else {
+        guard !isInFlight else {
             FileHandle.standardError.write(Data("[oauth] startOAuth: ignored (already in flight, status=\(oauthStatus))\n".utf8))
             return
         }
@@ -149,6 +166,7 @@ struct LoginSheet: View {
         // task silently no-op. URLSession's awaits release the main thread,
         // so running on @MainActor doesn't block UI.
         Task { @MainActor in
+            var savedSnapshot = false
             do {
                 let token = try await ClaudeOAuthLogin.run(session: session)
                 oauthStatus = .exchanging
@@ -158,6 +176,16 @@ struct LoginSheet: View {
                     expiresIn: token.expiresIn,
                     for: acctId
                 )
+                savedSnapshot = true
+
+                // Verify the token actually works before telling the user
+                // "Saved." A 200 from /api/oauth/profile confirms the token
+                // is live and the account is active. If this fails, the
+                // saved snapshot is useless — delete it so we don't leave
+                // a bogus "Signed in" state for next app launch.
+                oauthStatus = .validating
+                _ = try await AnthropicUsageAPI.fetchProfile(token: token.accessToken)
+
                 oauthStatus = .done
                 oauthSession = nil
                 onFinished?()
@@ -168,6 +196,11 @@ struct LoginSheet: View {
                 oauthStatus = .idle
                 oauthSession = nil
             } catch {
+                // If validation failed after the snapshot was written,
+                // roll back so the UI isn't misleading on next open.
+                if savedSnapshot, case .validating = oauthStatus {
+                    ClaudeAuthSource.deleteSnapshot(for: acctId)
+                }
                 FileHandle.standardError.write(Data("[oauth] failed: \(error)\n".utf8))
                 oauthStatus = .failed(error.localizedDescription)
                 oauthSession = nil

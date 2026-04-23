@@ -1,26 +1,34 @@
 import SwiftUI
 import AppKit
 
-/// Reads per-configDir login state straight off disk so the Accounts UI
-/// can show an at-a-glance signed-in/-out indicator without waiting for
-/// a refresh round-trip.
+/// Unified login state for an account, combining on-disk credential checks
+/// with the most recent API result from `RefreshCoordinator`.
+///
+/// Before, Settings used a file-only check and the popover used the API
+/// result. They could disagree — e.g. file says "logged in" but the token
+/// was already revoked server-side. `.tokenInvalid` reconciles the two: the
+/// file exists, but the API told us it doesn't actually work.
 enum LoginStatus: Equatable {
-    case signedIn(email: String?)
-    case signedOut
+    case signedIn(email: String?)       // file present AND last API call succeeded
+    case tokenInvalid(email: String?)   // file present but API returned 401/403
+    case pending                        // file present, API not yet called
+    case signedOut                      // no credential file
 
     var isSignedIn: Bool {
         if case .signedIn = self { return true }
         return false
     }
 
-    static func read(_ account: Account) -> LoginStatus {
+    /// File-only read; used on the menu-bar hot path where we don't have a
+    /// UsageState in scope. Returns either `.signedIn` or `.signedOut`.
+    static func readFile(_ account: Account) -> LoginStatus {
         switch account.provider {
         case .claude:
             // Check LLimit's own per-account credential snapshot first.
             if ClaudeAuthSource.hasSnapshot(for: account.id) {
                 if let bundle = try? ClaudeAuthSource(accountId: account.id).load(),
                    !bundle.accessToken.isEmpty {
-                    return .signedIn(email: nil)
+                    return .signedIn(email: claudeEmailFromCLI(account))
                 }
             }
             // Fall back to the CLI's .claude.json for email display.
@@ -42,24 +50,60 @@ enum LoginStatus: Equatable {
             let hasToken = (tokens?["access_token"] as? String)?.isEmpty == false
                 || (root["OPENAI_API_KEY"] as? String)?.isEmpty == false
             guard hasToken else { return .signedOut }
-            // Email lives inside the id_token JWT; we parse it lazily here
-            // since this read happens off the menu-bar hot path.
-            var email: String?
-            if let idToken = tokens?["id_token"] as? String {
-                let parts = idToken.split(separator: ".")
-                if parts.count >= 2 {
-                    var s = String(parts[1])
-                        .replacingOccurrences(of: "-", with: "+")
-                        .replacingOccurrences(of: "_", with: "/")
-                    while s.count % 4 != 0 { s.append("=") }
-                    if let d = Data(base64Encoded: s),
-                       let claims = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-                        email = claims["email"] as? String
-                    }
-                }
-            }
+            return .signedIn(email: codexEmailFromIDToken(tokens))
+        }
+    }
+
+    /// Combined view: cross-checks the file state with the most recent API
+    /// result. If the file says "signed in" but the API returned a "not
+    /// signed in"/auth error, we report `.tokenInvalid` instead.
+    static func read(_ account: Account, usageState: UsageState) -> LoginStatus {
+        let fileStatus = readFile(account)
+        guard case .signedIn(let email) = fileStatus else { return .signedOut }
+
+        switch usageState {
+        case .loaded(let snap):
+            return .signedIn(email: snap.email ?? email)
+        case .error(let msg) where isAuthError(msg):
+            return .tokenInvalid(email: email)
+        case .idle, .loading, .error:
+            // File says signed in but no confirmed-bad API result yet —
+            // stay tentatively "signed in" so the row doesn't flicker on
+            // every transient network error.
             return .signedIn(email: email)
         }
+    }
+
+    private static func isAuthError(_ msg: String) -> Bool {
+        msg.contains("Not signed in") ||
+        msg.contains("Login") ||
+        msg.contains("HTTP 401") ||
+        msg.contains("HTTP 403")
+    }
+
+    private static func claudeEmailFromCLI(_ account: Account) -> String? {
+        let path = account.configDir + "/.claude.json"
+        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let oauth = root["oauthAccount"] as? [String: Any] else {
+            return nil
+        }
+        return oauth["emailAddress"] as? String
+    }
+
+    private static func codexEmailFromIDToken(_ tokens: [String: Any]?) -> String? {
+        guard let idToken = tokens?["id_token"] as? String else { return nil }
+        let parts = idToken.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var s = String(parts[1])
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        while s.count % 4 != 0 { s.append("=") }
+        guard let d = Data(base64Encoded: s),
+              let claims = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else {
+            return nil
+        }
+        return claims["email"] as? String
     }
 }
 
@@ -123,9 +167,7 @@ private struct AccountsTab: View {
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Circle()
-                            .fill(LoginStatus.read(acc).isSignedIn ? Color.green : Color.secondary.opacity(0.4))
-                            .frame(width: 7, height: 7)
+                        statusDot(for: acc)
                     }
                     .tag(acc.id)
                 }
@@ -179,6 +221,21 @@ private struct AccountsTab: View {
         }
         let target = i + delta
         return target >= 0 && target < store.accounts.count
+    }
+
+    @ViewBuilder
+    private func statusDot(for account: Account) -> some View {
+        let status = LoginStatus.read(account, usageState: refresher.states[account.id] ?? .idle)
+        switch status {
+        case .signedIn:
+            Circle().fill(Color.green).frame(width: 7, height: 7)
+        case .tokenInvalid:
+            Circle().fill(Color.orange).frame(width: 7, height: 7)
+        case .pending:
+            Circle().fill(Color.secondary.opacity(0.4)).frame(width: 7, height: 7)
+        case .signedOut:
+            Circle().fill(Color.secondary.opacity(0.4)).frame(width: 7, height: 7)
+        }
     }
 
     @ViewBuilder
@@ -344,18 +401,7 @@ private struct EditForm: View {
 
     @ViewBuilder
     private var loginStatusRow: some View {
-        let fileStatus = LoginStatus.read(draft)
-        // If file says signed in but the API returned an auth error,
-        // show "token expired" instead of misleading "Signed in".
-        let isApiAuthError: Bool = {
-            if case .error(let msg) = usageState,
-               msg.contains("Not signed in") || msg.contains("Login") {
-                return true
-            }
-            return false
-        }()
-        let status: LoginStatus = (fileStatus.isSignedIn && isApiAuthError)
-            ? .signedOut : fileStatus
+        let status = LoginStatus.read(draft, usageState: usageState)
         HStack(spacing: 6) {
             switch status {
             case .signedIn(let email):
@@ -368,12 +414,17 @@ private struct EditForm: View {
                     Text("Signed in")
                         .font(.callout)
                 }
-            case .signedOut where fileStatus.isSignedIn:
+            case .tokenInvalid:
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
                 Text("Token expired — sign in again")
                     .font(.callout)
                     .foregroundStyle(.orange)
+            case .pending:
+                ProgressView().controlSize(.small)
+                Text("Checking…")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             case .signedOut:
                 Image(systemName: "xmark.seal")
                     .foregroundStyle(.secondary)
